@@ -22,7 +22,12 @@ http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["http1"] }
 hyper-util = { workspace = true, features = ["server-graceful", "server-auto"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "fs", "net"] }
+tokio = { workspace = true, features = [
+  "rt-multi-thread",
+  "fs",
+  "net",
+  "macros",
+] }
 tokio-util = { workspace = true, features = ["io", "io-util", "futures-util"] }
 
 anyhow = { workspace = true }

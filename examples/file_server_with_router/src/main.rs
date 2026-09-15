@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use uhttp::AsyncWriteExt;
+use uhttp::Server;
 use uhttp::StatusCode;
 use uhttp::file_server::ETagStrategy;
 use uhttp::file_server::FileServerOptions;
@@ -17,10 +17,8 @@ async fn main() -> anyhow::Result<()> {
 
   let mut app = uhttp::router::Router::new_without_context();
 
-  app.get("/api", |_req, mut res, _ctx| async move {
-    res.write_all(b"Hello From API").await?;
-    res.write_head(StatusCode::OK).await?;
-    Ok(())
+  app.get("/api", |_req, res, _ctx| async move {
+    res.status(StatusCode::OK).body("Hello From API")
   });
 
   app.get(
@@ -35,7 +33,8 @@ async fn main() -> anyhow::Result<()> {
     })),
   );
 
-  uhttp::http1::create_server(app.handler())
+  Server::builder()
+    .handler(app.handler())
     .listen("0.0.0.0:8080")
     .await?;
 

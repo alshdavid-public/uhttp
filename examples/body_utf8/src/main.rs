@@ -2,21 +2,21 @@
   Test with:
     curl -H "Content-Type: text/plain" -d 'Hello From Client' http://localhost:8080
 */
-use tokio::io::AsyncWriteExt;
+use uhttp::Server;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  uhttp::http1::create_server(|mut req, mut res| async move {
-    println!("{}", req.uri());
+  Server::builder()
+    .handler(|mut req, res| async move {
+      println!("{}", req.uri);
 
-    let body = uhttp::body::utf8(&mut req.body()).await?;
-    println!("{}", body);
+      let body = uhttp::body::utf8(&mut req.body).await?;
+      println!("{}", body);
 
-    res.write_all(b"Ok\n").await?;
-    Ok(())
-  })
-  .listen("0.0.0.0:8080")
-  .await?;
+      res.body("Ok\n")
+    })
+    .listen("0.0.0.0:8080")
+    .await?;
 
   Ok(())
 }

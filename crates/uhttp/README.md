@@ -12,14 +12,11 @@
 
 ```shell
 cargo add uhttp
-cargo add uhttp -F query                      # Query string deserialization
-cargo add uhttp -F json                       # JSON deserialization
+cargo add uhttp -F json                       # JSON body deserialization
 cargo add uhttp -F router                     # Router for URLs
-cargo add uhttp -F http2                      # Support for HTTP/2 with SSL
 cargo add uhttp -F websocket                  # Support for Websockets
 cargo add uhttp -F file_server                # File server that reads from the file system
-cargo add uhttp -F file_server_include_dir    # File server that reads from embedded files
-cargo add uhttp -F anyhow                     # Support for error handling with anyhow
+cargo add uhttp -F full                       # Everything
 ```
 
 ## Usage
@@ -27,17 +24,19 @@ cargo add uhttp -F anyhow                     # Support for error handling with 
 ### Basic Response
 
 ```rust
-use uhttp::*;
+use uhttp::Server;
+use uhttp::StatusCode;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  uhttp::http1::create_server(|req, mut res| async move {
-    res.header().add("Content-Type", "text/html").await?;
-    res.write_all(b"<body>hello world</body>").await?;
-    Ok(())
-  })
-  .listen("0.0.0.0:8080")
-  .await?;
+  Server::builder()
+    .handler(|_req, res| async move {
+      res
+        .header("Content-Type", "text/html")
+        .body("<body>hello world</body>")
+    })
+    .listen("0.0.0.0:8080")
+    .await?;
 
   Ok(())
 }
@@ -48,23 +47,31 @@ async fn main() -> anyhow::Result<()> {
 ```rust
 use std::time::Duration;
 
-use uhttp::*;
+use tokio::io::AsyncWriteExt;
+use tokio::time::sleep;
+use uhttp::ResponseBody;
+use uhttp::Server;
+use uhttp::StatusCode;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  uhttp::http1::create_server(|req, mut res| async move {
-    // Send the headers before sending the body chunks
-    res.write_head(uhttp::StatusCode::OK).await?;
+  Server::builder()
+    .handler(|_req, res| async move {
+      // `ResponseBody::chunked` hands back a writer the body is streamed through
+      let (body, mut writer) = ResponseBody::chunked(1024);
 
-    for i in 0..10 {
-      res.write_all(format!("{}", i).as_bytes()).await?;
-      tokio::time::sleep(Duration::from_millis(1000)).await;
-    }
+      tokio::task::spawn(async move {
+        for i in 0..10 {
+          let _ = writer.write_all(format!("{}", i).as_bytes()).await;
+          sleep(Duration::from_millis(1000)).await;
+        }
+        let _ = writer.shutdown().await;
+      });
 
-    Ok(())
-  })
-  .listen("0.0.0.0:8080")
-  .await?;
+      res.status(StatusCode::OK).body(body)
+    })
+    .listen("0.0.0.0:8080")
+    .await?;
 
   Ok(())
 }
@@ -75,8 +82,8 @@ async fn main() -> anyhow::Result<()> {
 ```rust
 use std::path::PathBuf;
 
-use uhttp;
-use uhttp::file_server::EtagStrategy;
+use uhttp::Server;
+use uhttp::file_server::ETagStrategy;
 use uhttp::file_server::FileServerOptions;
 
 #[tokio::main]
@@ -84,15 +91,19 @@ async fn main() -> anyhow::Result<()> {
   // Change this to the directory where the files live
   let static_files_dir: PathBuf = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static");
 
-  uhttp::http1::create_server(uhttp::file_server::create(FileServerOptions {
-    dir:static_files_dir,
-    // JIT Compression
-    compress: true,
-    // ETag to prevent client from making multiple requests
-    etag: ETagStrategy::LastModified,
-  }))
-  .listen("0.0.0.0:8080")
-  .await?;
+  Server::builder()
+    .handler(uhttp::file_server::create(FileServerOptions {
+      dir: static_files_dir,
+      // JIT Compression
+      compress: true,
+      // ETag to prevent client from making multiple requests
+      etag: ETagStrategy::LastModified,
+      custom_headers: Default::default(),
+      fallback_route: Default::default(),
+      fallback_status: Default::default(),
+    }))
+    .listen("0.0.0.0:8080")
+    .await?;
 
   Ok(())
 }
@@ -103,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
 ```rust
 use serde::Deserialize;
 use serde::Serialize;
-use uhttp::*;
+use uhttp::Server;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BodyJson {
@@ -112,19 +123,19 @@ pub struct BodyJson {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  uhttp::http1::create_server(|mut req, mut res| async move {
-    // Parse incoming JSON body
-    let body = uhttp::body::json::<BodyJson>(&mut req.body()).await?;
+  Server::builder()
+    .handler(|mut req, res| async move {
+      // Parse incoming JSON body
+      let body = uhttp::body::json::<BodyJson>(&mut req.body).await?;
 
-    // Serialize response body
-    let result = serde_json::to_vec(&body)?;
+      // Serialize response body
+      let result = serde_json::to_vec(&body)?;
 
-    // Respond with serialized body
-    res.write_all(&result).await?;
-    Ok(())
-  })
-  .listen("0.0.0.0:8080")
-  .await?;
+      // Respond with serialized body
+      res.body(result)
+    })
+    .listen("0.0.0.0:8080")
+    .await?;
 
   Ok(())
 }
@@ -133,42 +144,37 @@ async fn main() -> anyhow::Result<()> {
 ### Router
 
 ```rust
-use uhttp::*;
+use uhttp::Server;
+use uhttp::StatusCode;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
   let mut app = uhttp::router::Router::new_without_context();
 
-  app.get("/foo", |_req, mut res, _ctx| async move {
-    res.write(b"foo\n").await?;
-    Ok(())
+  app.get("/foo", |_req, res, _ctx| async move {
+    res.body("foo\n")
   });
 
-  app.post("/bar", |_req, mut res| async move {
-    res.write(b"bar\n").await?;
-    Ok(())
+  app.post("/bar", |_req, res, _ctx| async move {
+    res.body("bar\n")
   });
 
   // Example of a URL parameter
-  app.get("/fizz/:buzz", |req, mut res, _ctx| async move {
-    res.write(b"fizz\n").await?;
-
-    let Some(buzz) = req.url_param("buzz") else {
-      res.write_head(uhttp::StatusCode::BAD_REQUEST).await?;
-      return Ok(());
+  app.get("/fizz/:buzz", |req, res, _ctx| async move {
+    let Some(buzz) = req.params.get("buzz") else {
+      return res.status(StatusCode::BAD_REQUEST).body("fizz\n");
     };
 
-    res.write_all(format!("Param: {}", buzz).as_bytes()).await?;
-    Ok(())
+    res.body(format!("fizz\nParam: {}\n", buzz))
   });
 
   // Can be used to serve static assets
-  app.any("/*", |_req, mut res, _ctx| async move {
-    res.write(b"Not found route").await?;
-    Ok(())
+  app.any("/*", |_req, res, _ctx| async move {
+    res.body("Not found route")
   });
 
-  uhttp::http1::create_server(app.handler())
+  Server::builder()
+    .handler(app.handler())
     .listen("0.0.0.0:8080")
     .await?;
 
@@ -187,6 +193,8 @@ Examples;
 - Add logging
 
 ```rust
+use uhttp::router::Next;
+
 #[derive(Clone)]
 struct Context {
   random_string: String,
@@ -194,9 +202,14 @@ struct Context {
 }
 
 /// Mutate Context to inject a random string
-async fn my_middleware(req: uhttp::Request, res: uhttp::Response, mut ctx: Context) {
+async fn my_middleware(
+  req: uhttp::Request,
+  res: uhttp::Response,
+  mut ctx: Context,
+  next: Next<Context>,
+) -> uhttp::HandlerResult {
   ctx.random_string = generate_random_string();
-  return Ok(Some(req, res, ctx)) // Next middleware
+  next.run(req, res, ctx).await
 }
 
 #[tokio::main]
@@ -208,12 +221,12 @@ async fn main() -> anyhow::Result<()> {
 
   let mut app = uhttp::router::Router::new(ctx);
 
-  app.with_all(my_middleware);
+  app.with(my_middleware);
 
-  app.get("/", |req, mut res, ctx| async move {
+  app.get("/", |_req, res, ctx| async move {
     println!("{}", ctx.reference_string); // Prints "Reference to a string"
     println!("{}", ctx.random_string);    // "<random_string>" each request will get a new random string
-    Ok(())
+    res.body("ok")
   });
 
   // server.listen
@@ -223,27 +236,23 @@ async fn main() -> anyhow::Result<()> {
 ### HTTP/2
 
 ```rust
-use uhttp;
-use uhttp::AsyncWriteExt;
+use uhttp::Server;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
   let cert_path = PathBuf::from(std::env::var("SSL_CERT_PATH").expect("Missing SSL_CERT_PATH env var"));
   let key_path = PathBuf::from(std::env::var("SSL_KEY_PATH").expect("Missing SSL_KEY_PATH env var"));
 
-  uhttp::http2::create_server(
-    uhttp::http2::Http2ServerOptions {
-      cert_path: Some(cert_path),
-      key_path: Some(key_path),
-    },
-    |_req, mut res| async move {
-      res.header().add("Content-Type", "text/html").await?;
-      res.write_all(b"<body>Hello World!</body>").await?;
-      return Ok(());
-    },
-  )
-  .listen("0.0.0.0:8080")
-  .await?;
+  // TLS termination is configured through the builder, see the `uhttp` docs for
+  // the current TLS options. The handler shape is identical to HTTP/1:
+  Server::builder()
+    .handler(|_req, res| async move {
+      res
+        .header("Content-Type", "text/html")
+        .body("<body>Hello World!</body>")
+    })
+    .listen("0.0.0.0:8080")
+    .await?;
 
   Ok(())
 }
@@ -257,30 +266,25 @@ async fn main() -> anyhow::Result<()> {
 ```rust
 use std::time::Duration;
 
-use uhttp;
-use uhttp::websocket::WebSocket;
+use uhttp::Server;
+use uhttp::websocket::Websocket;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  uhttp::http1::create_server(move |req, res| async move {
-      let (mut socket_sender, mut socket_reciever) = WebSocket::upgrade(req, res).await?;
+  Server::builder()
+    .handler(|req, res| async move {
+      Websocket::upgrade(req, res, |mut socket| async move {
+        tokio::task::spawn(async move {
+          loop {
+            if socket.send("Hello").await.is_err() {
+              break;
+            };
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+          }
+        });
 
-      tokio::task::spawn(async move {
-        loop {
-          if socket_sender.send_text("Hello").await.is_err() {
-            break;
-          };
-          tokio::time::sleep(Duration::from_millis(1000)).await;
-        }
-      });
-
-      tokio::task::spawn(async move {
-        while let Some(Ok(msg)) = socket_reciever.next().await {
-          println!("GOT: {:?}", msg);
-        }
-      });
-
-      Ok(())
+        Ok(())
+      })
     })
     .listen("0.0.0.0:8080")
     .await?;

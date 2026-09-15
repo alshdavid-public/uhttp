@@ -4,21 +4,20 @@
 */
 use std::collections::HashMap;
 
-use uhttp::AsyncWriteExt;
+use uhttp::Server;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  uhttp::http1::create_server(|req, mut res| async move {
-    let query = req.parse_query::<HashMap<String, String>>()?;
+  Server::builder()
+    .handler(|req, res| async move {
+      let query = req.query::<HashMap<String, String>>()?;
 
-    res.header().add("Content-Type", "text/html").await?;
-    res
-      .write_all(format!("<body>{:?}</body>", query).as_bytes())
-      .await?;
-    Ok(())
-  })
-  .listen("0.0.0.0:8080")
-  .await?;
+      res
+        .header("Content-Type", "text/html")
+        .body(format!("<body>{:?}</body>", query))
+    })
+    .listen("0.0.0.0:8080")
+    .await?;
 
   Ok(())
 }

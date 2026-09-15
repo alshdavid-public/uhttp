@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::hash::DefaultHasher;
+use std::hash::Hasher;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -7,12 +9,16 @@ use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncSeekExt;
 use tokio::io::AsyncWrite;
+use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
-use xxhash_rust::xxh3::Xxh3;
 
 use crate::HandleFunc;
 use crate::Request;
+use crate::ResponseBody;
 use crate::StatusCode;
+
+/// Size of the buffer bodies are streamed through on their way to the client
+const BODY_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, Default)]
 pub enum ETagStrategy {
@@ -48,37 +54,33 @@ pub fn create(options: FileServerOptions) -> HandleFunc {
     Some(path) => options.dir.join(path),
     None => options.dir.join("404.html"),
   });
-  let fallback_status = Arc::new(match options.fallback_status.as_ref() {
+  let fallback_status = match options.fallback_status.as_ref() {
     Some(status) => *status,
     None => StatusCode::NOT_FOUND,
-  });
+  };
 
   Box::new(move |req, mut res| {
     let options = Arc::clone(&options);
     let fallback_path = Arc::clone(&fallback_path);
-    let fallback_status = Arc::clone(&fallback_status);
 
     Box::pin(async move {
-      let url_path = determine_file(req.uri().path());
+      let url_path = determine_file(req.uri.path());
       let mut extension = try_extension(&url_path)?;
-      let mut fallback_with_status = None::<Arc<StatusCode>>;
+      let mut status = StatusCode::OK;
 
       for (key, value) in &options.custom_headers {
-        res.header().set(key, value).await?;
+        res = res.header(key.as_str(), value.as_str());
       }
 
       let mut file = match tokio::fs::File::open(&options.dir.join(&url_path)).await {
         Ok(file) => file,
         Err(_) => match tokio::fs::File::open(&*fallback_path).await {
           Ok(file) => {
-            fallback_with_status = Some(fallback_status);
+            status = fallback_status;
             extension = try_extension(&fallback_path)?;
             file
           }
-          Err(_) => {
-            res.write_head(StatusCode::NOT_FOUND).await?;
-            return Ok(());
-          }
+          Err(_) => return res.status(StatusCode::NOT_FOUND).body(""),
         },
       };
 
@@ -86,85 +88,98 @@ pub fn create(options: FileServerOptions) -> HandleFunc {
         .first_or_octet_stream()
         .to_string();
 
-      res.header().add("Content-Type", &mime_type).await?;
+      res = res.header("Content-Type", mime_type.as_str());
 
-      if options.compress
-        && let Some(accept_encoding) = req.headers().get("Accept-Encoding")
-        && let Ok(accept_encoding) = accept_encoding.to_str()
-      {
-        if accept_encoding.contains("zstd") {
-          res.header().add("Content-Encoding", "zstd").await?;
+      let encoding = negotiate_encoding(&req, options.compress);
 
-          if let Some(etag) = etag_file(&mut file, &options.etag, "zstd").await? {
-            if !has_modified(&req, &etag) {
-              res.write_head(StatusCode::NOT_MODIFIED).await?;
-              return Ok(());
-            }
-            res.header().add("ETag", &etag).await?;
-          }
-          match fallback_with_status {
-            Some(status) => res.write_head(*status).await?,
-            None => res.write_head(StatusCode::OK).await?,
-          };
-          zstd_stream(&mut file, &mut res).await?;
-          return Ok(());
-        } else if accept_encoding.contains("br") {
-          res.header().add("Content-Encoding", "br").await?;
-
-          if let Some(etag) = etag_file(&mut file, &options.etag, "br").await? {
-            if !has_modified(&req, &etag) {
-              res.write_head(StatusCode::NOT_MODIFIED).await?;
-              return Ok(());
-            }
-            res.header().add("ETag", &etag).await?;
-          }
-          match fallback_with_status {
-            Some(status) => res.write_head(*status).await?,
-            None => res.write_head(StatusCode::OK).await?,
-          };
-          brotli_stream(&mut file, &mut res).await?;
-          return Ok(());
-        } else if accept_encoding.contains("gz") {
-          res.header().add("Content-Encoding", "gzip").await?;
-          if let Some(etag) = etag_file(&mut file, &options.etag, "gzip").await? {
-            if !has_modified(&req, &etag) {
-              res.write_head(StatusCode::NOT_MODIFIED).await?;
-              return Ok(());
-            }
-            res.header().add("ETag", &etag).await?;
-          }
-          match fallback_with_status {
-            Some(status) => res.write_head(*status).await?,
-            None => res.write_head(StatusCode::OK).await?,
-          };
-          gzip_stream(&mut file, &mut res).await?;
-          return Ok(());
-        }
+      if let Some(content_encoding) = encoding.header_value() {
+        res = res.header("Content-Encoding", content_encoding);
       }
 
-      if let Some(etag) = etag_file(&mut file, &options.etag, "").await? {
+      if let Some(etag) = etag_file(&mut file, &options.etag, encoding.etag_suffix()).await? {
         if !has_modified(&req, &etag) {
-          res.write_head(StatusCode::NOT_MODIFIED).await?;
-          return Ok(());
+          return res.status(StatusCode::NOT_MODIFIED).body("");
         }
-        res.header().add("ETag", &etag).await?;
+        res = res.header("ETag", etag.as_str());
       }
 
-      match fallback_with_status {
-        Some(status) => res.write_head(*status).await?,
-        None => res.write_head(StatusCode::OK).await?,
-      };
-      tokio::io::copy(&mut file, &mut res).await?;
-      Ok(())
+      let (body, mut writer) = ResponseBody::chunked(BODY_BUFFER_SIZE);
+
+      // The body is written after the response head has been handed back, so the
+      // copy has to outlive this future. A client hanging up mid transfer shows up
+      // as a write error here and there is no longer anywhere to report it to.
+      tokio::task::spawn(async move {
+        let _ = match encoding {
+          Encoding::Zstd => zstd_stream(&mut file, &mut writer).await,
+          Encoding::Brotli => brotli_stream(&mut file, &mut writer).await,
+          Encoding::Gzip => gzip_stream(&mut file, &mut writer).await,
+          Encoding::Identity => tokio::io::copy(&mut file, &mut writer).await,
+        };
+        let _ = writer.shutdown().await;
+      });
+
+      res.status(status).body(body)
     })
   })
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Encoding {
+  Zstd,
+  Brotli,
+  Gzip,
+  Identity,
+}
+
+impl Encoding {
+  /// Value to send back in the `Content-Encoding` header, if any
+  fn header_value(&self) -> Option<&'static str> {
+    match self {
+      Self::Zstd => Some("zstd"),
+      Self::Brotli => Some("br"),
+      Self::Gzip => Some("gzip"),
+      Self::Identity => None,
+    }
+  }
+
+  /// Mixed into the etag so encodings of the same file don't share a cache entry
+  fn etag_suffix(&self) -> &'static str {
+    self.header_value().unwrap_or("")
+  }
+}
+
+fn negotiate_encoding(
+  req: &Request,
+  compress: bool,
+) -> Encoding {
+  if !compress {
+    return Encoding::Identity;
+  }
+
+  let Some(accept_encoding) = req.headers.get("Accept-Encoding") else {
+    return Encoding::Identity;
+  };
+
+  let Ok(accept_encoding) = accept_encoding.to_str() else {
+    return Encoding::Identity;
+  };
+
+  if accept_encoding.contains("zstd") {
+    Encoding::Zstd
+  } else if accept_encoding.contains("br") {
+    Encoding::Brotli
+  } else if accept_encoding.contains("gz") {
+    Encoding::Gzip
+  } else {
+    Encoding::Identity
+  }
 }
 
 fn has_modified(
   req: &Request,
   etag: &str,
 ) -> bool {
-  if let Some(if_none_match) = req.headers().get("If-None-Match")
+  if let Some(if_none_match) = req.headers.get("If-None-Match")
     && if_none_match == etag
   {
     return false;
@@ -191,7 +206,7 @@ async fn etag_file(
     ETagStrategy::Hash => {
       let file_handle_copy = file.try_clone().await?;
       let mut reader = BufReader::new(file_handle_copy);
-      let mut hasher = Xxh3::new();
+      let mut hasher = DefaultHasher::new();
       let mut buffer = [0u8; 64 * 1024];
 
       loop {
@@ -199,12 +214,12 @@ async fn etag_file(
         if n == 0 {
           break;
         }
-        hasher.update(&buffer[..n]);
+        hasher.write(&buffer[..n]);
       }
 
       file.seek(std::io::SeekFrom::Start(0)).await?;
 
-      Ok(Some(format!("{:016x}", hasher.digest())))
+      Ok(Some(format!("{:016x}{}", hasher.finish(), encoding)))
     }
     ETagStrategy::LastModified => {
       let meta = file.metadata().await?;

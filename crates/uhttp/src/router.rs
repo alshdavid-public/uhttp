@@ -6,63 +6,44 @@ use std::sync::Arc;
 use http::Method;
 use path_tree::PathTree;
 use percent_encoding::percent_decode_str;
-use tokio::io::AsyncWriteExt;
 
-use super::RouteBuilder;
+use crate::HandlerResponse;
 use crate::Request;
 use crate::Response;
 
-pub(super) type RouterHandleFuncInner<Context> = Arc<
-  dyn 'static
-    + Send
-    + Sync
-    + Fn(
-      Request,
-      Response,
-      Context,
-    ) -> Pin<Box<dyn 'static + Send + Future<Output = crate::Result<()>>>>,
->;
+pub type RouterFuture =
+  Pin<Box<dyn 'static + Send + Future<Output = crate::Result<HandlerResponse>>>>;
 
-pub(super) type RouterMiddlewareFuncInner<Context> = Arc<
-  dyn 'static
-    + Send
-    + Sync
-    + Fn(
-      Request,
-      Response,
-      Context,
-    ) -> Pin<
-      Box<
-        dyn 'static + Send + Future<Output = crate::Result<Option<(Request, Response, Context)>>>,
-      >,
-    >,
->;
+pub(super) type RouterHandleFuncInner<Context> =
+  Arc<dyn 'static + Send + Sync + Fn(Request, Response, Context) -> RouterFuture>;
 
-pub type RouterHandleFunc<Context> = Box<
-  dyn 'static
-    + Send
-    + Sync
-    + Fn(
-      Request,
-      Response,
-      Context,
-    ) -> Pin<Box<dyn 'static + Send + Future<Output = crate::Result<()>>>>,
->;
+pub(super) type RouterMiddlewareFuncInner<Context> =
+  Arc<dyn 'static + Send + Sync + Fn(Request, Response, Context, Next<Context>) -> RouterFuture>;
 
-pub type RouterMiddlewareFunc<Context> = Box<
-  dyn 'static
-    + Send
-    + Sync
-    + Fn(
-      Request,
-      Response,
-      Context,
-    ) -> Pin<
-      Box<
-        dyn 'static + Send + Future<Output = crate::Result<Option<(Request, Response, Context)>>>,
-      >,
-    >,
->;
+pub type RouterHandleFunc<Context> =
+  Box<dyn 'static + Send + Sync + Fn(Request, Response, Context) -> RouterFuture>;
+
+pub type RouterMiddlewareFunc<Context> =
+  Box<dyn 'static + Send + Sync + Fn(Request, Response, Context, Next<Context>) -> RouterFuture>;
+
+pub struct Next<Context> {
+  middleware: std::vec::IntoIter<RouterMiddlewareFuncInner<Context>>,
+  handler: RouterHandleFuncInner<Context>,
+}
+
+impl<Context> Next<Context> {
+  pub fn run(
+    mut self,
+    req: Request,
+    res: Response,
+    ctx: Context,
+  ) -> RouterFuture {
+    match self.middleware.next() {
+      Some(middleware) => middleware(req, res, ctx, self),
+      None => (self.handler)(req, res, ctx),
+    }
+  }
+}
 
 pub(super) type PathTreeRoute<T> = (Vec<RouterMiddlewareFuncInner<T>>, RouterHandleFuncInner<T>);
 
@@ -70,6 +51,7 @@ pub struct Router<T>
 where
   T: Clone + Send + Sync + 'static,
 {
+  base_path: String,
   middleware: Vec<RouterMiddlewareFuncInner<T>>,
   any_routes: Rc<RefCell<PathTree<PathTreeRoute<T>>>>,
   get_routes: Rc<RefCell<PathTree<PathTreeRoute<T>>>>,
@@ -89,6 +71,7 @@ impl Router<()> {
 impl<T: Clone + Send + Sync + 'static> Router<T> {
   pub fn new(context: T) -> Self {
     Self {
+      base_path: String::new(),
       middleware: Vec::new(),
       any_routes: Rc::new(RefCell::new(PathTree::new())),
       get_routes: Rc::new(RefCell::new(PathTree::new())),
@@ -100,37 +83,46 @@ impl<T: Clone + Send + Sync + 'static> Router<T> {
     }
   }
 
-  pub fn with_all<F, Fut>(
-    &mut self,
-    middleware: F,
-  ) where
-    F: 'static + Send + Sync + Fn(Request, Response, T) -> Fut,
-    Fut: 'static + Send + Future<Output = crate::Result<Option<(Request, Response, T)>>>,
-  {
-    self.middleware.push(Arc::new(move |req, res, ctx| {
-      Box::pin(middleware(req, res, ctx))
-    }));
+  pub fn extend(
+    source: &Self,
+    base_path: &str,
+  ) -> Router<T> {
+    Router {
+      base_path: base_path.to_string(),
+      middleware: source.middleware.clone(),
+      any_routes: Rc::clone(&source.any_routes),
+      get_routes: Rc::clone(&source.get_routes),
+      post_routes: Rc::clone(&source.post_routes),
+      put_routes: Rc::clone(&source.put_routes),
+      patch_routes: Rc::clone(&source.patch_routes),
+      delete_routes: Rc::clone(&source.delete_routes),
+      context: source.context.clone(),
+    }
   }
 
   pub fn with<F, Fut>(
     &mut self,
     middleware: F,
-  ) -> RouteBuilder<T>
+  ) -> Router<T>
   where
-    F: 'static + Send + Sync + Fn(Request, Response, T) -> Fut,
-    Fut: 'static + Send + Future<Output = crate::Result<Option<(Request, Response, T)>>>,
+    F: 'static + Send + Sync + Fn(Request, Response, T, Next<T>) -> Fut,
+    Fut: 'static + Send + Future<Output = crate::Result<HandlerResponse>>,
   {
     let middleware: RouterMiddlewareFuncInner<T> =
-      Arc::new(move |req, res, ctx| Box::pin(middleware(req, res, ctx)));
+      Arc::new(move |req, res, ctx, next| Box::pin(middleware(req, res, ctx, next)));
 
-    RouteBuilder {
-      middleware: vec![middleware],
+    let mut current_middleware = self.middleware.clone();
+    current_middleware.push(middleware);
+    Router {
+      base_path: self.base_path.clone(),
+      middleware: current_middleware,
       any_routes: Rc::clone(&self.any_routes),
       get_routes: Rc::clone(&self.get_routes),
       post_routes: Rc::clone(&self.post_routes),
       put_routes: Rc::clone(&self.put_routes),
       patch_routes: Rc::clone(&self.patch_routes),
       delete_routes: Rc::clone(&self.delete_routes),
+      context: self.context.clone(),
     }
   }
 
@@ -140,12 +132,12 @@ impl<T: Clone + Send + Sync + 'static> Router<T> {
     handler: F,
   ) where
     F: 'static + Send + Sync + Fn(Request, Response, T) -> Fut,
-    Fut: 'static + Send + Future<Output = crate::Result<()>>,
+    Fut: 'static + Send + Future<Output = crate::Result<crate::HandlerResponse>>,
   {
     let _ = self.get_routes.borrow_mut().insert(
-      route,
+      &self.route(route),
       (
-        Vec::new(),
+        self.middleware.clone(),
         Arc::new(move |req, res, ctx| Box::pin(handler(req, res, ctx))),
       ),
     );
@@ -157,12 +149,12 @@ impl<T: Clone + Send + Sync + 'static> Router<T> {
     handler: F,
   ) where
     F: 'static + Send + Sync + Fn(Request, Response, T) -> Fut,
-    Fut: 'static + Send + Future<Output = crate::Result<()>>,
+    Fut: 'static + Send + Future<Output = crate::Result<crate::HandlerResponse>>,
   {
     let _ = self.post_routes.borrow_mut().insert(
-      route,
+      &self.route(route),
       (
-        Vec::new(),
+        self.middleware.clone(),
         Arc::new(move |req, res, ctx| Box::pin(handler(req, res, ctx))),
       ),
     );
@@ -174,12 +166,12 @@ impl<T: Clone + Send + Sync + 'static> Router<T> {
     handler: F,
   ) where
     F: 'static + Send + Sync + Fn(Request, Response, T) -> Fut,
-    Fut: 'static + Send + Future<Output = crate::Result<()>>,
+    Fut: 'static + Send + Future<Output = crate::Result<crate::HandlerResponse>>,
   {
     let _ = self.put_routes.borrow_mut().insert(
-      route,
+      &self.route(route),
       (
-        Vec::new(),
+        self.middleware.clone(),
         Arc::new(move |req, res, ctx| Box::pin(handler(req, res, ctx))),
       ),
     );
@@ -191,12 +183,12 @@ impl<T: Clone + Send + Sync + 'static> Router<T> {
     handler: F,
   ) where
     F: 'static + Send + Sync + Fn(Request, Response, T) -> Fut,
-    Fut: 'static + Send + Future<Output = crate::Result<()>>,
+    Fut: 'static + Send + Future<Output = crate::Result<crate::HandlerResponse>>,
   {
     let _ = self.patch_routes.borrow_mut().insert(
-      route,
+      &self.route(route),
       (
-        Vec::new(),
+        self.middleware.clone(),
         Arc::new(move |req, res, ctx| Box::pin(handler(req, res, ctx))),
       ),
     );
@@ -208,12 +200,12 @@ impl<T: Clone + Send + Sync + 'static> Router<T> {
     handler: F,
   ) where
     F: 'static + Send + Sync + Fn(Request, Response, T) -> Fut,
-    Fut: 'static + Send + Future<Output = crate::Result<()>>,
+    Fut: 'static + Send + Future<Output = crate::Result<crate::HandlerResponse>>,
   {
     let _ = self.delete_routes.borrow_mut().insert(
-      route,
+      &self.route(route),
       (
-        Vec::new(),
+        self.middleware.clone(),
         Arc::new(move |req, res, ctx| Box::pin(handler(req, res, ctx))),
       ),
     );
@@ -225,40 +217,40 @@ impl<T: Clone + Send + Sync + 'static> Router<T> {
     handler: F,
   ) where
     F: 'static + Send + Sync + Fn(Request, Response, T) -> Fut,
-    Fut: 'static + Send + Future<Output = crate::Result<()>>,
+    Fut: 'static + Send + Future<Output = crate::Result<crate::HandlerResponse>>,
   {
     let handler: RouterHandleFuncInner<T> =
       Arc::new(move |req, res, ctx| Box::pin(handler(req, res, ctx)));
 
-    let _ = self
-      .get_routes
-      .borrow_mut()
-      .insert(route, (Vec::new(), Arc::clone(&handler)));
+    let _ = self.get_routes.borrow_mut().insert(
+      &self.route(route),
+      (self.middleware.clone(), Arc::clone(&handler)),
+    );
 
-    let _ = self
-      .post_routes
-      .borrow_mut()
-      .insert(route, (Vec::new(), Arc::clone(&handler)));
+    let _ = self.post_routes.borrow_mut().insert(
+      &self.route(route),
+      (self.middleware.clone(), Arc::clone(&handler)),
+    );
 
-    let _ = self
-      .put_routes
-      .borrow_mut()
-      .insert(route, (Vec::new(), Arc::clone(&handler)));
+    let _ = self.put_routes.borrow_mut().insert(
+      &self.route(route),
+      (self.middleware.clone(), Arc::clone(&handler)),
+    );
 
-    let _ = self
-      .patch_routes
-      .borrow_mut()
-      .insert(route, (Vec::new(), Arc::clone(&handler)));
+    let _ = self.patch_routes.borrow_mut().insert(
+      &self.route(route),
+      (self.middleware.clone(), Arc::clone(&handler)),
+    );
 
-    let _ = self
-      .delete_routes
-      .borrow_mut()
-      .insert(route, (Vec::new(), Arc::clone(&handler)));
+    let _ = self.delete_routes.borrow_mut().insert(
+      &self.route(route),
+      (self.middleware.clone(), Arc::clone(&handler)),
+    );
 
     let _ = self
       .any_routes
       .borrow_mut()
-      .insert(route, (Vec::new(), handler));
+      .insert(&self.route(route), (self.middleware.clone(), handler));
   }
 
   pub fn handler(&self) -> crate::HandleFunc {
@@ -271,7 +263,7 @@ impl<T: Clone + Send + Sync + 'static> Router<T> {
     let delete_routes = Arc::new(self.delete_routes.borrow().clone());
     let context = self.context.clone();
 
-    Box::new(move |mut req, mut res| {
+    Box::new(move |mut req, res| {
       let middleware = middleware.clone();
       let any_routes = any_routes.clone();
       let get_routes = get_routes.clone();
@@ -279,21 +271,12 @@ impl<T: Clone + Send + Sync + 'static> Router<T> {
       let put_routes = put_routes.clone();
       let patch_routes = patch_routes.clone();
       let delete_routes = delete_routes.clone();
-      let mut context = context.clone();
+      let context = context.clone();
 
       Box::pin(async move {
-        for middleware in &*middleware {
-          let Some((new_req, new_res, new_context)) = middleware(req, res, context).await? else {
-            return Ok(());
-          };
-          req = new_req;
-          res = new_res;
-          context = new_context;
-        }
-
         let path = req.uri.path().to_string();
 
-        let routes = match *req.method() {
+        let routes = match req.method {
           Method::GET => get_routes,
           Method::POST => post_routes,
           Method::PUT => put_routes,
@@ -302,20 +285,16 @@ impl<T: Clone + Send + Sync + 'static> Router<T> {
           _ => Arc::clone(&any_routes),
         };
 
-        let Some(((middleware, handler), params)) = routes.find(&path) else {
-          res.write_all(b"").await?;
-          res.write_head(crate::StatusCode::NOT_FOUND).await?;
-          return Ok(());
+        let Some(((route_middleware, handler), params)) = routes.find(&path) else {
+          return Next {
+            middleware: middleware.as_ref().clone().into_iter(),
+            handler: Arc::new(|_req, res: Response, _ctx| {
+              Box::pin(async move { res.status(crate::StatusCode::NOT_FOUND).body("") })
+            }),
+          }
+          .run(req, res, context)
+          .await;
         };
-
-        for middleware in middleware {
-          let Some((new_req, new_res, new_context)) = middleware(req, res, context).await? else {
-            return Ok(());
-          };
-          req = new_req;
-          res = new_res;
-          context = new_context;
-        }
 
         for (key, value) in params.params() {
           req.params.insert(
@@ -324,9 +303,29 @@ impl<T: Clone + Send + Sync + 'static> Router<T> {
           );
         }
 
-        handler(req, res, context).await?;
-        Ok(())
+        Next {
+          middleware: route_middleware.clone().into_iter(),
+          handler: Arc::clone(handler),
+        }
+        .run(req, res, context)
+        .await
       })
     })
   }
+
+  fn route(
+    &self,
+    mut target: &str,
+  ) -> String {
+    if !self.base_path.is_empty() && target == "/" {
+      target = ""
+    }
+    format!("{}{}", self.base_path, target)
+  }
+}
+
+pub fn without_context<T: 'static + Clone + Send + Sync>(
+  handler: crate::HandleFunc
+) -> crate::router::RouterHandleFunc<T> {
+  Box::new(move |req, res, _ctx| handler(req, res))
 }

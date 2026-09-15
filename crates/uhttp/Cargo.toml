@@ -1,34 +1,17 @@
 [package]
 name = "uhttp"
-version = "0.20.0"
+version = "0.21.0"
 edition = "2024"
 description = "Simple http server for humans"
 license = "MIT"
 repository = "https://github.com/alshdavid/uhttp"
 
 [features]
-full = [
-  "json",
-  "query",
-  "router",
-  "http2",
-  "websocket",
-  "file_server",
-  "file_server_include_dir",
-]
-anyhow = ["dep:anyhow"]
-json = ["dep:serde", "dep:serde_json"]
-query = ["dep:serde", "dep:serde_urlencoded"]
+full = ["json", "router", "websocket", "file_server"]
+json = ["dep:serde_json"]
 router = ["dep:percent-encoding", "dep:path-tree"]
-http2 = ["dep:tokio-rustls", "dep:rustls-pemfile"]
-websocket = ["dep:sha1", "dep:base64", "dep:tokio-tungstenite"]
-file_server = ["dep:mime_guess", "dep:xxhash-rust", "dep:async-compression"]
-file_server_include_dir = [
-  "file_server",
-  "dep:include_dir",
-  "dep:flate2",
-  "dep:brotli",
-]
+websocket = ["dep:tokio-tungstenite"]
+file_server = ["dep:mime_guess", "dep:async-compression"]
 
 [lints]
 workspace = true
@@ -42,14 +25,10 @@ hyper-util = { workspace = true, features = ["server-graceful", "server-auto"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "fs", "net"] }
 tokio-util = { workspace = true, features = ["io", "io-util", "futures-util"] }
 
-tokio-rustls = { workspace = true, optional = true }
-rustls-pemfile = { workspace = true, optional = true }
+anyhow = { workspace = true }
 
 # Optional dependencies for JSON support
-anyhow = { workspace = true, optional = true }
-
-# Optional dependencies for JSON support
-serde = { workspace = true, features = ["derive"], optional = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, optional = true }
 
 # Optional dependencies for router support
@@ -57,13 +36,10 @@ path-tree = { workspace = true, optional = true }
 percent-encoding = { workspace = true, optional = true }
 
 # Optional dependencies for websocket support
-base64 = { workspace = true, optional = true }
-sha1 = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true }
 
 # Optional dependencies for Static File Server
 mime_guess = { workspace = true, optional = true }
-xxhash-rust = { workspace = true, optional = true, features = ["xxh3"] }
 async-compression = { workspace = true, optional = true, features = [
   "tokio",
   "gzip",
@@ -77,4 +53,4 @@ flate2 = { workspace = true, optional = true }
 brotli = { workspace = true, optional = true }
 
 # Optional dependencies for query string parsing
-serde_urlencoded = { workspace = true, optional = true }
+serde_urlencoded = { workspace = true }

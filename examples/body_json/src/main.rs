@@ -4,7 +4,7 @@
 */
 use serde::Deserialize;
 use serde::Serialize;
-use uhttp::*;
+use uhttp::Server;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BodyJson {
@@ -13,20 +13,19 @@ pub struct BodyJson {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  uhttp::http1::create_server(|mut req, mut res| async move {
-    // Parse incoming JSON body
-    let body = uhttp::body::json::<BodyJson>(&mut req.body()).await?;
+  Server::builder()
+    .handler(|mut req, res| async move {
+      // Parse incoming JSON body
+      let body = uhttp::body::json::<BodyJson>(&mut req.body).await?;
 
-    // Serialize response body
-    let result = serde_json::to_vec(&body)
-      .map_err(|_| uhttp::Error::generic("Failed to serialise response"))?;
+      // Serialize response body
+      let result = serde_json::to_vec(&body)?;
 
-    // Respond with serialized body
-    res.write_all(&result).await?;
-    Ok(())
-  })
-  .listen("0.0.0.0:8080")
-  .await?;
+      // Respond with serialized body
+      res.body(result)
+    })
+    .listen("0.0.0.0:8080")
+    .await?;
 
   Ok(())
 }

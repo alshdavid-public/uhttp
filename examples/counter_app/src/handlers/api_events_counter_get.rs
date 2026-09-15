@@ -1,32 +1,35 @@
-use uhttp::AsyncWriteExt;
+use uhttp::HandlerResponse;
+use uhttp::sse::ServerSentEvents;
+use uhttp::sse::ServerSentEventsOptions;
 
 use crate::context::Context;
 
 // Event Source that emits when the value is updated
 pub async fn api_events_counter_get(
   _req: uhttp::Request,
-  mut res: uhttp::Response,
+  res: uhttp::Response,
   Context { counter_service }: Context,
-) -> uhttp::Result<()> {
+) -> uhttp::Result<HandlerResponse> {
+  let (body, events) = ServerSentEvents::new(ServerSentEventsOptions {
+    max_buffer_size: 1024,
+    heartbeat_duration: std::time::Duration::from_secs(15),
+  });
+
+  tokio::task::spawn(async move {
+    // Send initial value with subscription
+    let _ = events.send(counter_service.get()).await;
+
+    // Listen for updates
+    let mut rx = counter_service.subsribe().await;
+    while rx.recv().await.is_some() {
+      if events.send(counter_service.get()).await.is_err() {
+        break;
+      }
+    }
+  });
+
   res
-    .header()
-    .add("Content-Type", "text/event-stream")
-    .await?;
-
-  res.header().add("Transfer-Encoding", "chunked").await?;
-  res.write_head(uhttp::StatusCode::OK).await?;
-
-  // Send initial value with subscription
-  res
-    .write_all(format!("data: {}\n\n", counter_service.get()).as_bytes())
-    .await?;
-
-  // Listen for updates
-  let mut rx = counter_service.subsribe().await;
-  while rx.recv().await.is_some() {
-    let msg = format!("data: {}\n\n", counter_service.get());
-    res.write_all(msg.as_bytes()).await?;
-  }
-
-  Ok(())
+    .header("Content-Type", "text/event-stream")
+    .header("Cache-Control", "no-cache")
+    .body(body)
 }

@@ -9,10 +9,10 @@ mod services;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use uhttp::Server;
 use uhttp::file_server;
 use uhttp::file_server::ETagStrategy;
 use uhttp::file_server::FileServerOptions;
-use uhttp::{self};
 
 use crate::context::Context;
 use crate::services::counter_service::CounterService;
@@ -28,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
 
   let mut app = uhttp::router::Router::new(ctx);
 
-  app.with_all(uhttp::middleware::logger_default);
+  app.with(uhttp::middleware::logger_default);
 
   app.get("/api/counter", handlers::api_counter_get);
   app.get("/api/events/counter", handlers::api_events_counter_get);
@@ -45,7 +45,8 @@ async fn main() -> anyhow::Result<()> {
       fallback_status: Default::default(),
     })));
 
-  uhttp::http1::create_server(app.handler())
+  Server::builder()
+    .handler(app.handler())
     .listen("0.0.0.0:8080")
     .await?;
 

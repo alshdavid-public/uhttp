@@ -1,6 +1,6 @@
 [package]
 name = "uhttp"
-version = "0.21.0"
+version = "0.22.0"
 edition = "2024"
 description = "Simple http server for humans"
 license = "MIT"
@@ -9,7 +9,7 @@ repository = "https://github.com/alshdavid/uhttp"
 [features]
 full = ["json", "router", "websocket", "file_server"]
 json = ["dep:serde_json"]
-router = ["dep:percent-encoding", "dep:path-tree"]
+router = ["dep:percent-encoding", "dep:path-tree", "dep:base64"]
 websocket = ["dep:tokio-tungstenite"]
 file_server = ["dep:mime_guess", "dep:async-compression"]
 
@@ -39,6 +39,7 @@ serde_json = { workspace = true, optional = true }
 # Optional dependencies for router support
 path-tree = { workspace = true, optional = true }
 percent-encoding = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
 
 # Optional dependencies for websocket support
 tokio-tungstenite = { workspace = true, optional = true }
